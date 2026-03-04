@@ -124,6 +124,15 @@ end)
 -- Enable break indent
 vim.o.breakindent = true
 
+-- length of an actual \t character:
+vim.o.tabstop = 2
+-- length to use when editing text (eg. TAB and BS keys)
+-- (0 for ‘tabstop’, -1 for ‘shiftwidth’):
+vim.o.softtabstop = -1
+-- length to use when shifting text (eg. <<, >> and == commands)
+-- (0 for ‘tabstop’):
+vim.o.shiftwidth = 0
+
 -- Save undo history
 vim.o.undofile = true
 
@@ -217,6 +226,9 @@ end, { desc = "Move focus to the upper window" })
 vim.keymap.set("n", "<C-.>", function()
   vim.lsp.buf.code_action()
 end, { desc = "LSP Code Action" })
+
+-- Vertical split
+vim.keymap.set("n", "<leader>sv", "<cmd>vsplit<CR>", { desc = "[S]plit [V]ertically" })
 
 -- NOTE: Some terminals have colliding keymaps or are not able to send distinct keycodes
 -- vim.keymap.set("n", "<C-S-h>", "<C-w>H", { desc = "Move window to the left" })
@@ -693,6 +705,17 @@ require("lazy").setup({
       --  - capabilities (table): Override fields in capabilities. Can be used to disable certain LSP features.
       --  - settings (table): Override the default settings passed when initializing the server.
       --        For example, to see the options for `lua_ls`, you could go to: https://luals.github.io/wiki/settings/
+      local tslsInlayHints = {
+        includeInlayParameterNameHints = "all", -- 'none' | 'literals' | 'all'
+        includeInlayParameterNameHintsWhenArgumentMatchesName = false,
+        includeInlayVariableTypeHints = false,
+        includeInlayFunctionParameterTypeHints = true,
+        includeInlayVariableTypeHintsWhenTypeMatchesName = false,
+        includeInlayPropertyDeclarationTypeHints = true,
+        includeInlayFunctionLikeReturnTypeHints = false,
+        includeInlayEnumMemberValueHints = true,
+      }
+
       local servers = {
         -- clangd = {},
         -- gopls = {},
@@ -704,7 +727,117 @@ require("lazy").setup({
         --    https://github.com/pmizio/typescript-tools.nvim
         --
         -- But for many setups, the LSP (`ts_ls`) will work just fine
-        ts_ls = {},
+        ts_ls = {
+          init_options = { hostInfo = "neovim" },
+          cmd = { "typescript-language-server", "--stdio" },
+          filetypes = {
+            "javascript",
+            "javascriptreact",
+            "javascript.jsx",
+            "typescript",
+            "typescriptreact",
+            "typescript.tsx",
+          },
+          root_markers = { "tsconfig.json", "jsconfig.json", "package.json", ".git" },
+          handlers = {
+            -- handle rename request for certain code actions like extracting functions / types
+            ["_typescript.rename"] = function(_, result, ctx)
+              local client = assert(vim.lsp.get_client_by_id(ctx.client_id))
+              vim.lsp.util.show_document({
+                uri = result.textDocument.uri,
+                range = {
+                  start = result.position,
+                  ["end"] = result.position,
+                },
+              }, client.offset_encoding)
+              vim.lsp.buf.rename()
+              return vim.NIL
+            end,
+          },
+          commands = {
+            ["editor.action.showReferences"] = function(command, ctx)
+              local client = assert(vim.lsp.get_client_by_id(ctx.client_id))
+              local file_uri, position, references = unpack(command.arguments)
+
+              local quickfix_items = vim.lsp.util.locations_to_items(references, client.offset_encoding)
+              vim.fn.setqflist({}, " ", {
+                title = command.title,
+                items = quickfix_items,
+                context = {
+                  command = command,
+                  bufnr = ctx.bufnr,
+                },
+              })
+
+              vim.lsp.util.show_document({
+                uri = file_uri,
+                range = {
+                  start = position,
+                  ["end"] = position,
+                },
+              }, client.offset_encoding)
+
+              vim.cmd("botright copen")
+            end,
+          },
+          on_attach = function(client, bufnr)
+            -- Enable inlay hints if nvim version is 0.10 or higher
+            if vim.fn.has("nvim-0.10") == 1 then
+              vim.lsp.inlay_hint.enable(true, { bufnr = bufnr })
+            end
+
+            -- ts_ls provides `source.*` code actions that apply to the whole file. These only appear in
+            -- `vim.lsp.buf.code_action()` if specified in `context.only`.
+            vim.api.nvim_buf_create_user_command(bufnr, "LspTypescriptSourceAction", function()
+              local source_actions = vim.tbl_filter(function(action)
+                return vim.startswith(action, "source.")
+              end, client.server_capabilities.codeActionProvider.codeActionKinds)
+
+              vim.lsp.buf.code_action({
+                context = {
+                  diagnostics = {},
+                  only = source_actions,
+                },
+              })
+            end, {})
+
+            vim.keymap.set("n", "<leader>ir", function()
+              vim.lsp.buf.code_action({
+                context = {
+                  diagnostics = {},
+                  ---@diagnostic disable-next-line: assign-type-mismatch
+                  only = { "source.removeUnused.ts" },
+                },
+                apply = true,
+              })
+            end, {
+              desc = "Remove unused imports",
+              buffer = bufnr,
+            })
+
+            vim.keymap.set("n", "<leader>if", function()
+              vim.lsp.buf.code_action({
+                context = {
+                  diagnostics = {},
+                  ---@diagnostic disable-next-line: assign-type-mismatch
+                  only = { "source.addMissingImports.ts" },
+                },
+                apply = true,
+              })
+            end, {
+              desc = "Fix imports",
+              buffer = bufnr,
+            })
+          end,
+          settings = {
+            typescript = {
+              inlayHints = tslsInlayHints,
+            },
+            javascript = {
+              inlayHints = tslsInlayHints,
+            },
+          },
+        },
         --
 
         lua_ls = {
@@ -773,35 +906,41 @@ require("lazy").setup({
         desc = "[F]ormat buffer",
       },
     },
-    opts = {
-      notify_on_error = false,
-      format_on_save = function(bufnr)
-        -- Disable "format_on_save lsp_fallback" for languages that don't
-        -- have a well standardized coding style. You can add additional
-        -- languages here or re-enable it for the disabled ones.
-        local disable_filetypes = { c = true, cpp = true }
-        if disable_filetypes[vim.bo[bufnr].filetype] then
-          return nil
-        else
-          return {
-            timeout_ms = 1000,
-            lsp_format = "fallback",
-          }
-        end
-      end,
-      formatters_by_ft = {
-        lua = { "stylua" },
-        -- Conform can also run multiple formatters sequentially
-        -- python = { "isort", "black" },
-        --
-        -- You can use 'stop_after_first' to run the first available formatter from the list
-        json = { "prettierd", "prettier", stop_after_first = true },
-        javascript = { "prettierd", "prettier", stop_after_first = true },
-        typescript = { "prettierd", "prettier", stop_after_first = true },
-        javascriptreact = { "prettierd", "prettier", stop_after_first = true },
-        typescriptreact = { "prettierd", "prettier", stop_after_first = true },
-      },
-    },
+    opts = function()
+      local biome = { "biome", "biome-organize-imports", "biome-check" }
+
+      return {
+        notify_on_error = false,
+        format_on_save = function(bufnr)
+          -- Disable "format_on_save lsp_fallback" for languages that don't
+          -- have a well standardized coding style. You can add additional
+          -- languages here or re-enable it for the disabled ones.
+          local disable_filetypes = { c = true, cpp = true }
+          if disable_filetypes[vim.bo[bufnr].filetype] then
+            return nil
+          else
+            return {
+              timeout_ms = 1000,
+              lsp_format = "fallback",
+            }
+          end
+        end,
+        formatters_by_ft = {
+          lua = { "stylua" },
+          -- Conform can also run multiple formatters sequentially
+          -- python = { "isort", "black" },
+          --
+          -- You can use 'stop_after_first' to run the first available formatter from the list
+
+          json = biome,
+          javascript = biome,
+          typescript = biome,
+          javascriptreact = biome,
+          typescriptreact = biome,
+          astro = biome,
+        },
+      }
+    end,
   },
 
   { -- Autocompletion
